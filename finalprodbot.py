@@ -36,13 +36,12 @@ async def save_user(connection, telegram_username, phone_number):
 
 
 
-async def save_request(connection, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo):
+async def save_request(connection, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, is_paid):
     query = """
-    INSERT INTO requests (request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo)
-    VALUES ($1, $2, $3, $4, $5, $6, $7);
+    INSERT INTO requests (request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, is_paid)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
     """
-    await connection.execute(query, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo)
-
+    await connection.execute(query, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, is_paid)
 
 
 def format_date(date_obj):
@@ -507,29 +506,57 @@ async def confirm_request(update: Update, context: CallbackContext):
 
     telegram_username = update.effective_user.username
     phone_number = None
-    warehouses = ''  # Инициализируем переменную warehouses
-
+    
     try:
         connection = await init_db()
 
         # Сохранение пользователя
         user_id = await save_user(connection, telegram_username, phone_number)
 
-        # Получаем ключи складов и преобразуем их в строки
-        warehouse_keys = list(user_data.get('warehouses', {}).keys())
-        string_warehouse_keys = list(map(str, warehouse_keys))  # Преобразуем ключи в строки
-        warehouses = ', '.join(string_warehouse_keys)  # Для отображения в сообщении
+        # Проверка, оплачивал ли пользователь уже тариф
+        paid_query = """
+        SELECT is_paid FROM requests WHERE user_id = $1 AND is_paid = TRUE LIMIT 1;
+        """
+        result = await connection.fetchrow(paid_query, user_id)
 
-        # Сохранение заявки
+        # Если пользователь ранее уже оплатил
+        if result and result['is_paid']:
+            message = (
+                "Заявка успешно создана:\n"
+                f"🏦 Склады: {', '.join(list(user_data.get('warehouses', {}).values()))}\n"
+                f"📦 Тип приемки: {delivery_type}\n"
+                f"📅 Период: {period_range}\n"
+                f"💸 Коэффициент: {user_data.get('acceptance_coefficient', 'Не выбран')}\n\n"
+                f"ID заявки: {request_id}\n\n"
+                "Оплата уже была произведена ранее, заявка подтверждена."
+            )
+            await update.callback_query.edit_message_text(message)
+            await connection.close()
+            return
+
+        # Получаем названия складов и фильтруем только строки
+        warehouses_dict = user_data.get('warehouses', {})
+        warehouse_names = [str(warehouse) for warehouse in warehouses_dict.values() if isinstance(warehouse, str)]
+
+        # Проверяем, что список не пустой
+        if not warehouse_names:
+            await update.callback_query.edit_message_text("Ошибка: список складов пуст или содержит некорректные данные.")
+            await connection.close()
+            return
+
+        warehouses = ', '.join(warehouse_names)
+
+        # Сохранение заявки с is_paid=False
         await save_request(
             connection,
             int(request_id),
             user_id,
-            string_warehouse_keys,  # Используем строковые ключи
+            warehouses,  # Здесь строка с названиями складов
             user_data.get('delivery_type', 'Не выбрано'),
             datetime.now().date(),
             user_data.get('acceptance_coefficient', 0),
-            None
+            None,
+            False  # Оплата еще не произведена
         )
         await update.callback_query.edit_message_text(f"Заявка сохранена успешно. Склады: {warehouses}")
 
@@ -541,14 +568,15 @@ async def confirm_request(update: Update, context: CallbackContext):
             await update.message.reply_text("Произошла ошибка при сохранении заявки.")
         return  # Завершаем выполнение функции после обработки ошибки
 
+    # Отправляем сообщение с ссылкой на оплату, если она еще не была произведена
     message = (
         "Запрос успешно создан:\n"
-        f"🏦 Склады: {warehouses}\n"  # Здесь warehouses уже инициализирована
+        f"🏦 Склады: {warehouses}\n"
         f"📦 Тип приемки: {delivery_type}\n"
-        f"📅 Период: {period_range}\n"  
+        f"📅 Период: {period_range}\n"
         f"💸 Коэффициент: {user_data.get('acceptance_coefficient', 'Не выбран')}\n\n"
         f"ID заявки: {request_id}\n\n"
-        "Для подтверждения заявки, пожалуйста, оплатите по ссылке ниже и отправьте чек или фотографию чека после оплаты.\n \n"
+        "Для подтверждения заявки, пожалуйста, оплатите по ссылке ниже и отправьте чек или фотографию чека после оплаты.\n\n"
         "После оплаты, отправьте чек в виде фотографии."
     )
 
@@ -564,6 +592,7 @@ async def confirm_request(update: Update, context: CallbackContext):
     context.user_data['awaiting_receipt'] = True
 
     await connection.close()
+
 
 
 

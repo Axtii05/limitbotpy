@@ -493,6 +493,7 @@ async def coefficient_selected(update: Update, context: CallbackContext):
 async def confirm_request(update: Update, context: CallbackContext):
     user_data = context.user_data.get('request', {})
     
+    # Проверяем, что данные заявки существуют
     if not user_data:
         await update.callback_query.edit_message_text("Ошибка: данные заявки отсутствуют.")
         return
@@ -509,9 +510,14 @@ async def confirm_request(update: Update, context: CallbackContext):
     
     try:
         connection = await init_db()
-
+        try:
         # Сохранение пользователя
-        user_id = await save_user(connection, telegram_username, phone_number)
+            user_id = await save_user(connection, telegram_username, phone_number)
+        
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении пользователя: {e}")
+            await update.callback_query.edit_message_text("Произошла ошибка при сохранении данных пользователя. Пожалуйста, попробуйте позже.")
+            return 
 
         # Проверка, оплачивал ли пользователь уже тариф
         paid_query = """
@@ -521,9 +527,10 @@ async def confirm_request(update: Update, context: CallbackContext):
 
         # Если пользователь ранее уже оплатил
         if result and result['is_paid']:
+            warehouses = ', '.join(list(user_data.get('warehouses', {}).values()))
             message = (
                 "Заявка успешно создана:\n"
-                f"🏦 Склады: {', '.join(list(user_data.get('warehouses', {}).values()))}\n"
+                f"🏦 Склады: {warehouses}\n"
                 f"📦 Тип приемки: {delivery_type}\n"
                 f"📅 Период: {period_range}\n"
                 f"💸 Коэффициент: {user_data.get('acceptance_coefficient', 'Не выбран')}\n\n"
@@ -534,24 +541,36 @@ async def confirm_request(update: Update, context: CallbackContext):
             await connection.close()
             return
 
-        # Получаем названия складов и фильтруем только строки
-        warehouses_dict = user_data.get('warehouses', {})
-        warehouse_names = [str(warehouse) for warehouse in warehouses_dict.values() if isinstance(warehouse, str)]
+        # Получаем ID складов 
+        warehouse_ids = list(user_data.get('warehouses', {}).keys()) 
+        logging.info(f"Содержимое warehouses: {warehouse_ids}")
 
-        # Проверяем, что список не пустой
+        # Проверяем, что список складов не пустой 
+        if not warehouse_ids:
+            await update.callback_query.edit_message_text("Ошибка: список складов пуст.")
+            await connection.close()
+            return
+
+        # Получаем названия складов по их ID
+        warehouse_names = [wh[1] for wh in warehouses_data if wh[0] in warehouse_ids]
+        
+
+        # Дополнительная проверка на наличие складов в warehouses_data
         if not warehouse_names:
-            await update.callback_query.edit_message_text("Ошибка: список складов пуст или содержит некорректные данные.")
+            await update.callback_query.edit_message_text("Ошибка: выбранные склады не найдены в базе данных.")
             await connection.close()
             return
 
         warehouses = ', '.join(warehouse_names)
+
+        warehouses = warehouse_names
 
         # Сохранение заявки с is_paid=False
         await save_request(
             connection,
             int(request_id),
             user_id,
-            warehouses,  # Здесь строка с названиями складов
+            warehouses,  # Строка с названиями складов
             user_data.get('delivery_type', 'Не выбрано'),
             datetime.now().date(),
             user_data.get('acceptance_coefficient', 0),
@@ -592,8 +611,6 @@ async def confirm_request(update: Update, context: CallbackContext):
     context.user_data['awaiting_receipt'] = True
 
     await connection.close()
-
-
 
 
 async def handle_receipt_photo(update: Update, context: CallbackContext):

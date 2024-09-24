@@ -344,10 +344,135 @@ async def search_limits(update: Update, context: CallbackContext):
     await update.callback_query.edit_message_text("Выберите запрос или создайте новый:", reply_markup=reply_markup)
 
 
-async def add_request(update: Update, context: CallbackContext):
-    context.user_data['request'] = {} 
-    await select_warehouse_for_limits(update, context)
+async def check_payment(connection, user_id):
+    """
+    Проверяет, оплатил ли пользователь хотя бы один запрос, 
+    обращаясь к полю is_paid в таблице users.
+    """
+    query = """
+    SELECT is_paid FROM users WHERE user_id = $1;
+    """
+    result = await connection.fetchrow(query, user_id)
+    return result and result['is_paid']
 
+async def add_request(update: Update, context: CallbackContext):
+    """
+    Обработчик кнопки "Добавить запрос". 
+    Проверяет оплату перед началом создания нового запроса.
+    """
+
+    try:
+        connection = await init_db()
+
+        telegram_username = update.effective_user.username
+        phone_number = None  # Или получите номер телефона, если он доступен
+
+        user_id = await save_user(connection, telegram_username, phone_number)
+
+        # Проверка оплаты
+        is_paid = await check_payment(connection, user_id)
+
+        if is_paid:  # Если пользователь уже оплатил хотя бы один запрос
+            context.user_data['request'] = {} 
+            await create_new_request(update, context) 
+        else:
+            keyboard = [
+                [InlineKeyboardButton("Оплатить", url='https://www.sberbank.com/sms/pbpn?requisiteNumber=9774160969&utm_campaign=sberitem_banner')],
+                [InlineKeyboardButton("Главное меню", callback_data='main_menu')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.callback_query.edit_message_text(
+                "Вы еще не оплачивали ни одного запроса. Пожалуйста, оплатите, чтобы создать новый запрос.",
+                reply_markup=reply_markup
+            )
+
+    except Exception as e:
+        logging.error(f"Ошибка при проверке оплаты: {e}")
+        await update.callback_query.edit_message_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
+    finally:
+        if connection:
+            await connection.close()
+
+async def get_request_from_db(connection, request_id):
+    """
+    Получает данные запроса из базы данных по его ID.
+    """
+    query = """
+    SELECT * FROM requests 
+    WHERE request_id = $1;
+    """
+    result = await connection.fetchrow(query, int(request_id))
+    if result is None:
+        raise ValueError(f"Запрос с ID {request_id} не найден в базе данных.")
+
+    # Преобразуем данные из базы данных в формат, совместимый с context.user_data['request']
+    request_data = {
+        'warehouses': {wh_id: wh_name for wh_id, wh_name in zip(result['warehouses'], result['warehouses'])},  # предполагаем, что warehouses хранит и id, и названия
+        'delivery_type': result['delivery_type'],
+        'date_period': result['request_date'],  # или другой способ хранения даты, в зависимости от вашей схемы
+        'acceptance_coefficient': result['coefficient']
+    }
+
+    return request_data
+
+
+async def save_request_changes(connection, request_id, updated_data):
+    """
+    Сохраняет изменения в существующем запросе в базе данных.
+    """
+    try:
+        # Формируем SQL-запрос UPDATE
+        query = """
+        UPDATE requests
+        SET warehouses = $1, delivery_type = $2, request_date = $3, coefficient = $4
+        WHERE request_id = $5;
+        """
+
+        # Выполняем запрос
+        await connection.execute(query, 
+                                updated_data['warehouses'], 
+                                updated_data['delivery_type'], 
+                                updated_data['date_period'], 
+                                updated_data['acceptance_coefficient'], 
+                                int(request_id))
+
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении изменений в запросе: {e}")
+        raise  # Передаем исключение дальше для обработки в вызывающей функции
+
+
+async def create_new_request(update: Update, context: CallbackContext):
+    """
+    Функция для создания нового запроса. Вызывает функции для выбора складов, типа доставки и т.д.
+    """
+    await select_warehouse_for_limits(update, context)  # Начинаем с выбора складов
+
+async def edit_existing_request(update: Update, context: CallbackContext):
+    """
+    Функция для редактирования существующего запроса. 
+    Получает данные запроса из базы данных и вызывает функции для их изменения.
+    """
+    query = update.callback_query
+    request_id = query.data.split('_')[-1]
+
+    try:
+        connection = await init_db() 
+        request_data = await get_request_from_db(connection, request_id)
+
+        context.user_data['request'] = request_data
+        context.user_data['request_id'] = request_id  # Сохраняем ID запроса для дальнейшего использования
+        await select_warehouse_for_limits(update, context) 
+
+    except ValueError as e: 
+        await query.answer(str(e)) 
+    finally:
+        if connection:
+            await connection.close()
+    # TODO: Получить данные запроса из базы данных по request_id
+    request_data = await get_request_from_db(connection, request_id)
+
+    context.user_data['request'] = requests[request_id]  # Пока используем данные из requests
+    await select_warehouse_for_limits(update, context)  # Начинаем с выбора складов (можно изменить на другую функцию)
 
 async def select_warehouse_for_limits(update: Update, context: CallbackContext):
     selected_warehouses = context.user_data.get('request', {}).get('warehouses', {})
@@ -616,6 +741,7 @@ async def confirm_request(update: Update, context: CallbackContext):
 async def handle_receipt_photo(update: Update, context: CallbackContext):
     if context.user_data.get('awaiting_receipt'):
         request_id = context.user_data.get('request_id')
+        user_id = context.user_data.get('user_id')  # Предполагаем, что user_id сохраняется где-то в контексте
 
         if update.message.photo:
             photo_file = await update.message.photo[-1].get_file()
@@ -623,6 +749,7 @@ async def handle_receipt_photo(update: Update, context: CallbackContext):
 
             connection = await init_db()
 
+            # Обновляем photo в таблице requests
             query = """
             UPDATE requests
             SET photo = $1
@@ -630,10 +757,16 @@ async def handle_receipt_photo(update: Update, context: CallbackContext):
             """
             await connection.execute(query, photo_data, int(request_id))
 
-            await connection.close()  
+            # Обновляем is_paid в таблице users
+            query = """
+            UPDATE users
+            SET is_paid = TRUE
+            WHERE user_id = $1
+            """
+            await connection.execute(query, user_id)
 
-            context.user_data['awaiting_receipt'] = False
-            
+            await connection.close()
+
             keyboard = [
                 [InlineKeyboardButton("Главное меню", callback_data='main_menu')]
             ]
@@ -643,7 +776,6 @@ async def handle_receipt_photo(update: Update, context: CallbackContext):
                 f"Чек получен. Ваша заявка {request_id} подтверждена.\nПоиск лимитов активирован ✅",
                 reply_markup=reply_markup
             )
-
         else:
             await update.message.reply_text("Пожалуйста, отправьте фотографию чека.")
     else:
